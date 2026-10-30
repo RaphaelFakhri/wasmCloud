@@ -5,7 +5,7 @@
 //! The `open` identifier is used as a key prefix (`{identifier}:{key}`) to
 //! namespace keys within a single Redis database.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ const PLUGIN_KEYVALUE_ID: &str = "wasi-keyvalue";
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
 use crate::plugin::{HostPlugin, WitInterfaces};
-use crate::wit::{WitInterface, WitWorld};
+use crate::wit::{Config, ConfigStr, WitInterface, WitWorld};
 use futures::StreamExt;
 use tracing::instrument;
 use wasmtime::component::Resource;
@@ -210,7 +210,7 @@ impl ConnectionSettings {
     ///
     /// A value that is not a whole number in range, a timeout of zero, or one
     /// key given twice under different spellings with different values.
-    pub(crate) fn from_config(config: &HashMap<String, String>) -> anyhow::Result<Self> {
+    pub(crate) fn from_config(config: &Config) -> anyhow::Result<Self> {
         let mut settings = Self::default();
         if let Some(v) = setting(config, RECONNECT_NUM_RETRIES_KEY)? {
             let retries =
@@ -298,7 +298,7 @@ fn split_connection_settings(url: &url::Url) -> anyhow::Result<(url::Url, Connec
         .query_pairs()
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .partition(|(k, _)| is_setting(k));
-    let mut config: HashMap<String, String> = HashMap::new();
+    let mut config = Config::new();
     for (k, v) in settings {
         // Two spellings of one key are refused by `from_config`; the same
         // spelling twice would be lost in the map, so refuse it here.
@@ -318,25 +318,28 @@ fn split_connection_settings(url: &url::Url) -> anyhow::Result<(url::Url, Connec
 }
 
 /// The value of `key` in `config`, in any spelling that folds to it.
-fn setting<'a>(config: &'a HashMap<String, String>, key: &str) -> anyhow::Result<Option<&'a str>> {
-    let mut found: Option<(&str, &str)> = None;
-    for (k, v) in config {
+fn setting<'a>(config: &'a Config, key: &str) -> anyhow::Result<Option<ConfigStr<'a>>> {
+    let mut found: Option<(&str, ConfigStr<'a>)> = None;
+    for (k, v) in config.iter() {
         if crate::plugin::bindings::canonical_key(k) != key {
             continue;
         }
+        let Some(v) = v.as_config_str() else {
+            anyhow::bail!("redis keyvalue config `{k}` is not text");
+        };
         match found {
-            Some((first, value)) if value != v.as_str() => anyhow::bail!(
+            Some((first, value)) if value.expose() != v.expose() => anyhow::bail!(
                 "redis keyvalue config sets `{key}` twice with different values \
                  (`{first}` and `{k}`)"
             ),
-            _ => found = Some((k.as_str(), v.as_str())),
+            _ => found = Some((k.as_str(), v)),
         }
     }
     Ok(found.map(|(_, v)| v))
 }
 
-fn parse_bounded(key: &str, value: &str, min: u64, max: u64) -> anyhow::Result<u64> {
-    let parsed: u64 = value.trim().parse().map_err(|_| {
+fn parse_bounded(key: &str, value: ConfigStr<'_>, min: u64, max: u64) -> anyhow::Result<u64> {
+    let parsed: u64 = value.expose().trim().parse().map_err(|_| {
         anyhow::anyhow!("redis keyvalue config `{key}` must be a whole number, got {value:?}")
     })?;
     anyhow::ensure!(
@@ -1284,11 +1287,8 @@ impl HostPlugin for RedisKeyValue {
 mod tests {
     use super::*;
 
-    fn config(entries: &[(&str, &str)]) -> HashMap<String, String> {
-        entries
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    fn config(entries: &[(&str, &str)]) -> Config {
+        entries.iter().copied().collect()
     }
 
     #[test]
@@ -1340,6 +1340,20 @@ mod tests {
             assert!(err.contains(key), "{key}={value:?}: {err}");
             assert!(err.contains(expect), "{key}={value:?}: {err}");
         }
+    }
+
+    #[test]
+    fn a_refused_secret_setting_is_not_quoted() {
+        let mut secret = Config::new();
+        secret.insert(
+            RESPONSE_TIMEOUT_MS_KEY,
+            crate::plugin::SecretValue::new("hunter2"),
+        );
+        let err = ConnectionSettings::from_config(&secret)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(RESPONSE_TIMEOUT_MS_KEY), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
     }
 
     #[test]
