@@ -271,6 +271,7 @@ impl SecretValue {
     }
 
     /// The value as text, or as bytes when it is not UTF-8. Never log it.
+    #[cfg_attr(not(all(feature = "host-component-plugins", feature = "oci")), allow(dead_code))]
     pub(crate) fn expose_bytes(&self) -> Result<&str, &[u8]> {
         match &self.0 {
             SecretBytes::Text(text) => Ok(text),

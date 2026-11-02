@@ -71,6 +71,7 @@ pub struct SecretState {
 /// A `wasmcloud:secrets` `secret` handle holding `value`, built in the store
 /// the factory runs in: how the host hands a secret to a plugin's guest, which
 /// reads it with `reveal`.
+#[cfg_attr(not(all(feature = "host-component-plugins", feature = "oci")), allow(dead_code))]
 pub(crate) fn secret_handle(
     value: crate::plugin::SecretValue,
 ) -> crate::engine::store::relocate::ValFactory {

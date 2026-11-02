@@ -54,6 +54,7 @@ pub enum Relocated {
     },
     /// A value the host builds in the destination store, such as a host
     /// resource it hands the callee.
+    #[cfg_attr(not(all(feature = "host-component-plugins", feature = "oci")), allow(dead_code))]
     Host(ValFactory),
     List(Vec<Relocated>),
     FixedLengthList(Vec<Relocated>),
