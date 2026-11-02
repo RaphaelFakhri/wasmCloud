@@ -68,23 +68,25 @@ pub struct SecretState {
     value: SecretValue,
 }
 
-/// A `wasmcloud:secrets` `secret` handle holding `value`, built in the store
-/// the factory runs in: how the host hands a secret to a plugin's guest, which
-/// reads it with `reveal`.
-#[cfg_attr(not(all(feature = "host-component-plugins", feature = "oci")), allow(dead_code))]
+/// A `wasmcloud:secrets` `secret` handle holding `value`, built in `store`:
+/// how the host hands a secret to a plugin's guest, which reads it with
+/// `reveal`.
+#[cfg_attr(
+    not(all(feature = "host-component-plugins", feature = "oci")),
+    allow(dead_code)
+)]
 pub(crate) fn secret_handle(
-    value: crate::plugin::SecretValue,
-) -> crate::engine::store::relocate::ValFactory {
-    Box::new(move |mut store| {
-        let value = match value.expose_bytes() {
-            Ok(text) => SecretValue::String(text.to_string()),
-            Err(bytes) => SecretValue::Bytes(bytes.to_vec()),
-        };
-        let handle = store.data_mut().table.push(SecretState { value })?;
-        Ok(wasmtime::component::Val::Resource(
-            handle.try_into_resource_any(store)?,
-        ))
-    })
+    mut store: wasmtime::StoreContextMut<'_, SharedCtx>,
+    value: &crate::plugin::SecretValue,
+) -> wasmtime::Result<wasmtime::component::Val> {
+    let value = match value.expose_bytes() {
+        Ok(text) => SecretValue::String(text.to_string()),
+        Err(bytes) => SecretValue::Bytes(bytes.to_vec()),
+    };
+    let handle = store.data_mut().table.push(SecretState { value })?;
+    Ok(wasmtime::component::Val::Resource(
+        handle.try_into_resource_any(store)?,
+    ))
 }
 
 impl Drop for SecretState {

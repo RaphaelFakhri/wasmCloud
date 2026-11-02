@@ -43,7 +43,6 @@ use crate::engine::ctx::{CallerIdentity, WorkloadCaller};
 use crate::engine::store::relocate::Relocated;
 use crate::engine::workload::UnresolvedWorkload;
 use crate::host::trigger_service::{CapabilityCall, CapabilityJob, LifecycleReplay};
-use crate::plugin::wasmcloud_secrets::secret_handle;
 use crate::plugin::{SecretValue, WitInterfaces};
 use crate::wit::{ConfigValue, WitInterface};
 
@@ -77,8 +76,8 @@ pub(super) struct LifecycleFuncs {
     pub(super) interface: Arc<str>,
     pub(super) bind: ExportedFunc,
     pub(super) unbind: ExportedFunc,
-    /// Whether `interface-binding` has `secrets`, which a plugin built against
-    /// `wasmcloud:host` before 0.1.5 lacks.
+    /// Whether the plugin imports `wasmcloud:host/binding-secrets`, the only
+    /// way it can read a binding's secrets.
     pub(super) takes_secrets: bool,
 }
 
@@ -129,6 +128,7 @@ pub(super) async fn remove_and_unbind(
 pub(super) fn lifecycle_funcs(
     id: &str,
     mut export: ExportedInterface,
+    takes_secrets: bool,
 ) -> anyhow::Result<LifecycleFuncs> {
     let mut bind = None;
     let mut unbind = None;
@@ -169,28 +169,12 @@ pub(super) fn lifecycle_funcs(
          string, and return nothing"
     );
 
-    let takes_secrets = takes_secrets(bind.param_tys.first());
     Ok(LifecycleFuncs {
         interface: export.name,
         bind,
         unbind,
         takes_secrets,
     })
-}
-
-/// Whether `workload-info`'s `interface-binding` records carry `secrets`.
-fn takes_secrets(workload_info: Option<&Type>) -> bool {
-    let Some(Type::Record(info)) = workload_info else {
-        return false;
-    };
-    let Some(Type::List(interfaces)) = info.fields().find(|f| f.name == "interfaces").map(|f| f.ty)
-    else {
-        return false;
-    };
-    match interfaces.ty() {
-        Type::Record(binding) => binding.fields().any(|f| f.name == "secrets"),
-        _ => false,
-    }
 }
 
 /// Snapshot the bound-workloads map into the replay list for a fresh
@@ -449,55 +433,41 @@ pub(super) fn spawn_deferred_unbind(
 }
 
 /// A `workload-info` for `on-workload-bind`, kept to deliver again on every
-/// replay. Each secret stays a [`SecretValue`] here and becomes a fresh
-/// `wasmcloud:secrets` handle in the plugin's store on each delivery.
+/// replay, and the secrets `wasmcloud:host/binding-secrets` hands out while
+/// it runs.
 #[derive(Clone)]
 pub(super) struct BindInfo {
-    fields: Vec<(String, Val)>,
-    interfaces: Vec<BindingInfo>,
+    info: Val,
+    secrets: Vec<BindingSecrets>,
 }
 
-/// One `interface-binding` of a [`BindInfo`].
+/// The secrets of one `interface-binding`, which its `config` leaves out;
+/// empty for a binding that holds none.
 #[derive(Clone)]
-struct BindingInfo {
-    fields: Vec<(String, Val)>,
-    /// `None` for a plugin whose record has no `secrets` field.
-    secrets: Option<Vec<(String, SecretValue)>>,
+struct BindingSecrets {
+    namespace: String,
+    package: String,
+    name: Option<String>,
+    secrets: Vec<(String, SecretValue)>,
 }
 
 impl BindInfo {
-    /// The `workload-info` record, each secret a handle built in the store
-    /// it is delivered to.
     pub(super) fn relocate(&self) -> Relocated {
-        let vals = |fields: &[(String, Val)]| {
-            fields
-                .iter()
-                .map(|(name, v)| (name.clone(), Relocated::Val(v.clone())))
-                .collect::<Vec<_>>()
-        };
-        let interfaces = self
-            .interfaces
+        Relocated::Val(self.info.clone())
+    }
+
+    /// The secrets of the binding of `namespace:package` labeled `name`, or
+    /// `None` when the workload has no such binding.
+    pub(super) fn secrets(
+        &self,
+        namespace: &str,
+        package: &str,
+        name: Option<&str>,
+    ) -> Option<&[(String, SecretValue)]> {
+        self.secrets
             .iter()
-            .map(|binding| {
-                let mut fields = vals(&binding.fields);
-                if let Some(secrets) = &binding.secrets {
-                    let secrets = secrets
-                        .iter()
-                        .map(|(key, value)| {
-                            Relocated::Tuple(vec![
-                                Relocated::Val(Val::String(key.clone())),
-                                Relocated::Host(secret_handle(value.clone())),
-                            ])
-                        })
-                        .collect();
-                    fields.push(("secrets".to_string(), Relocated::List(secrets)));
-                }
-                Relocated::Record(fields)
-            })
-            .collect();
-        let mut fields = vals(&self.fields);
-        fields.push(("interfaces".to_string(), Relocated::List(interfaces)));
-        Relocated::Record(fields)
+            .find(|b| b.namespace == namespace && b.package == package && b.name.as_deref() == name)
+            .map(|b| b.secrets.as_slice())
     }
 }
 
@@ -507,8 +477,8 @@ impl BindInfo {
 ///
 /// # Errors
 ///
-/// A binding holds a secret and the plugin's record has no `secrets` to
-/// receive it in.
+/// A binding holds a secret and the plugin does not import
+/// `wasmcloud:host/binding-secrets` to read it.
 pub(super) fn bind_info(
     id: &str,
     workload: &UnresolvedWorkload,
@@ -529,31 +499,34 @@ pub(super) fn bind_info(
     );
     let mut matched: Vec<&WitInterface> = interfaces.iter().collect();
     matched.sort_by_key(|i| i.instance());
-    let interfaces = matched
-        .into_iter()
-        .map(|iface| binding_info(id, iface, takes_secrets))
-        .collect::<anyhow::Result<_>>()?;
-    Ok(BindInfo {
-        fields: vec![
-            ("id".to_string(), Val::String(workload.id().to_string())),
-            ("name".to_string(), Val::String(workload.name().to_string())),
-            (
-                "namespace".to_string(),
-                Val::String(workload.namespace().to_string()),
-            ),
-            ("service".to_string(), service),
-            ("components".to_string(), components),
-        ],
-        interfaces,
-    })
+    let mut bindings = Vec::with_capacity(matched.len());
+    let mut secrets = Vec::new();
+    for iface in matched {
+        let (binding, held) = binding_info(id, iface, takes_secrets)?;
+        bindings.push(binding);
+        secrets.push(held);
+    }
+    let info = Val::Record(vec![
+        ("id".to_string(), Val::String(workload.id().to_string())),
+        ("name".to_string(), Val::String(workload.name().to_string())),
+        (
+            "namespace".to_string(),
+            Val::String(workload.namespace().to_string()),
+        ),
+        ("service".to_string(), service),
+        ("components".to_string(), components),
+        ("interfaces".to_string(), Val::List(bindings)),
+    ]);
+    Ok(BindInfo { info, secrets })
 }
 
-/// One matched [`WitInterface`] as a lifecycle `interface-binding`.
+/// One matched [`WitInterface`] as a lifecycle `interface-binding`, and its
+/// secrets.
 fn binding_info(
     id: &str,
     iface: &WitInterface,
     takes_secrets: bool,
-) -> anyhow::Result<BindingInfo> {
+) -> anyhow::Result<(Val, BindingSecrets)> {
     let mut names: Vec<&String> = iface.interfaces.iter().collect();
     names.sort();
     let mut config = Vec::new();
@@ -569,45 +542,48 @@ fn binding_info(
     }
     if !takes_secrets && let Some((key, _)) = secrets.first() {
         anyhow::bail!(
-            "host component plugin '{id}' was built against wasmcloud:host before 0.1.5, which \
-             takes config only as text, so it cannot be handed the secret in `{key}`; rebuild it \
-             to receive secrets as wasmcloud:secrets handles"
+            "host component plugin '{id}' does not import wasmcloud:host/binding-secrets, so it \
+             cannot read the secret in `{key}`"
         );
     }
-    Ok(BindingInfo {
-        fields: vec![
-            (
-                "namespace".to_string(),
-                Val::String(iface.namespace.clone()),
+    let binding = Val::Record(vec![
+        (
+            "namespace".to_string(),
+            Val::String(iface.namespace.clone()),
+        ),
+        ("package".to_string(), Val::String(iface.package.clone())),
+        (
+            "interfaces".to_string(),
+            Val::List(names.into_iter().map(|n| Val::String(n.clone())).collect()),
+        ),
+        (
+            "version".to_string(),
+            Val::Option(iface.version.as_ref().map(|v| Box::new(version_val(v)))),
+        ),
+        (
+            "name".to_string(),
+            Val::Option(
+                iface
+                    .name
+                    .as_ref()
+                    .map(|n| Box::new(Val::String(n.clone()))),
             ),
-            ("package".to_string(), Val::String(iface.package.clone())),
-            (
-                "interfaces".to_string(),
-                Val::List(names.into_iter().map(|n| Val::String(n.clone())).collect()),
-            ),
-            (
-                "version".to_string(),
-                Val::Option(iface.version.as_ref().map(|v| Box::new(version_val(v)))),
-            ),
-            (
-                "name".to_string(),
-                Val::Option(
-                    iface
-                        .name
-                        .as_ref()
-                        .map(|n| Box::new(Val::String(n.clone()))),
-                ),
-            ),
-            // Stubbed until component-model external-id lands (wasmCloud#5393):
-            // `WitInterface` grows an `external_id` there, and this becomes
-            // `iface.external_id.as_ref().map(..)` like `name` above. The WIT field
-            // exists now so that merge does not change the record shape again —
-            // adding a field to a WIT record is breaking for compiled plugins.
-            ("external-id".to_string(), Val::Option(None)),
-            ("config".to_string(), Val::List(config)),
-        ],
-        secrets: takes_secrets.then_some(secrets),
-    })
+        ),
+        // Stubbed until component-model external-id lands (wasmCloud#5393):
+        // `WitInterface` grows an `external_id` there, and this becomes
+        // `iface.external_id.as_ref().map(..)` like `name` above. The WIT field
+        // exists now so that merge does not change the record shape again —
+        // adding a field to a WIT record is breaking for compiled plugins.
+        ("external-id".to_string(), Val::Option(None)),
+        ("config".to_string(), Val::List(config)),
+    ]);
+    let secrets = BindingSecrets {
+        namespace: iface.namespace.clone(),
+        package: iface.package.clone(),
+        name: iface.name.clone(),
+        secrets,
+    };
+    Ok((binding, secrets))
 }
 
 /// A [`semver::Version`] as a lifecycle `version` record.
@@ -636,12 +612,14 @@ mod tests {
         iface
     }
 
-    /// A secret leaves `config` for `secrets`; text stays in `config`.
+    /// A secret is kept apart for `binding-secrets`; text stays in `config`.
     #[test]
-    fn a_secret_is_handed_over_apart_from_text_config() {
-        let binding = binding_info("kv", &iface(), true).unwrap();
-        let config = binding
-            .fields
+    fn a_secret_is_kept_apart_from_text_config() {
+        let (binding, secrets) = binding_info("kv", &iface(), true).unwrap();
+        let Val::Record(fields) = binding else {
+            panic!("an interface-binding is a record");
+        };
+        let config = fields
             .iter()
             .find(|(name, _)| name == "config")
             .map(|(_, v)| v.clone());
@@ -652,30 +630,31 @@ mod tests {
                 Val::String("redis://cache".to_string()),
             ])]))
         );
-        let secrets = binding.secrets.unwrap();
-        assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].0, "password");
-        assert_eq!(secrets[0].1.expose(), Some("hunter2"));
+        let info = BindInfo {
+            info: Val::Bool(true),
+            secrets: vec![secrets],
+        };
+        let held = info.secrets("acme", "kv", None).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, "password");
+        assert_eq!(held[0].1.expose(), Some("hunter2"));
+        assert!(info.secrets("acme", "kv", Some("cache")).is_none());
     }
 
-    /// A plugin whose record has no `secrets` is refused a secret, never handed
-    /// it as text.
+    /// A plugin that cannot read a secret is refused one, never handed it as
+    /// text.
     #[test]
-    fn a_plugin_without_secrets_is_refused_one() {
+    fn a_plugin_without_binding_secrets_is_refused_one() {
         let err = binding_info("kv", &iface(), false)
             .err()
-            .expect("a secret needs a `secrets` field")
+            .expect("a secret needs binding-secrets")
             .to_string();
         assert!(err.contains("`password`"), "{err}");
         assert!(!err.contains("hunter2"), "{err}");
 
         let mut text_only = iface();
         text_only.config.remove("password");
-        assert!(
-            binding_info("kv", &text_only, false)
-                .unwrap()
-                .secrets
-                .is_none()
-        );
+        let (_, held) = binding_info("kv", &text_only, false).unwrap();
+        assert!(held.secrets.is_empty());
     }
 }

@@ -81,9 +81,9 @@ fn caller(host: &str) -> wash_runtime::types::WorkloadStartRequest {
 }
 
 /// The secret reaches the consuming plugin's bind as a `wasmcloud:secrets`
-/// handle it reveals, never as text config, and the source was told which
-/// plugin and binding it was resolving for and which workload's bind needed
-/// it.
+/// handle it reads through `binding-secrets` and reveals, never as text
+/// config, and the source was told which plugin and binding it was resolving
+/// for and which workload's bind needed it.
 #[tokio::test]
 async fn a_plugin_secret_reaches_the_consuming_plugin() -> Result<()> {
     let host = "secret-source-ok";

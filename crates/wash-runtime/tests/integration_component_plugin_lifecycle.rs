@@ -54,8 +54,8 @@ const BRIDGE_BACKEND_WASM: &[u8] = include_bytes!("wasm/bridge_backend.wasm");
 const BADLIFECYCLE_WASM: &[u8] = include_bytes!("wasm/badlifecycle.wasm");
 const CONFIG_CALLEE_WASM: &[u8] = include_bytes!("wasm/config_callee.wasm");
 
-/// The natives a `kv-plugin` built here links: its lifecycle export takes
-/// `wasmcloud:secrets` handles.
+/// The natives a `kv-plugin` built here links: it reads its bindings' secrets
+/// as `wasmcloud:secrets` handles.
 fn secrets_native() -> HashMap<&'static str, Arc<dyn HostPlugin>> {
     let secrets: Arc<dyn HostPlugin> = Arc::new(WasmcloudSecrets::new());
     HashMap::from([(secrets.id(), secrets)])
@@ -585,7 +585,8 @@ async fn test_bind_timeout_defers_rollback_unbind() -> Result<()> {
 
     // The hook keeps running; once it returns (~6s) the deferred rollback fires.
     // Eventually the log shows the slow bind both completed AND was unbound, and
-    // its late-provisioned state is reclaimed (bind-info 404).
+    // its late-provisioned state is reclaimed (bind-info 404). The late hook is
+    // refused its binding secrets: the host has already forgotten the workload.
     let mut settled = false;
     for _ in 0..240 {
         let (ls, log) = req(&client, &addr, "obs", "/lifecycle-log").await?;
@@ -597,6 +598,9 @@ async fn test_bind_timeout_defers_rollback_unbind() -> Result<()> {
         )
         .await?;
         if ls.as_u16() == 200
+            && log
+                .lines()
+                .any(|l| l == format!("secrets-refused:{slow_id}"))
             && log.lines().any(|l| l == format!("bind:{slow_id}"))
             && log.lines().any(|l| l == format!("unbind:{slow_id}"))
             && bs.as_u16() == 404

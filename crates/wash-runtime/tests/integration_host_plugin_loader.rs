@@ -24,8 +24,8 @@ fn kv_plugin_path() -> PathBuf {
     ))
 }
 
-/// The natives kv-plugin links: its lifecycle export takes `wasmcloud:secrets`
-/// handles.
+/// The natives kv-plugin links: it reads its bindings' secrets as
+/// `wasmcloud:secrets` handles.
 fn natives() -> HashMap<&'static str, Arc<dyn HostPlugin>> {
     let secrets: Arc<dyn HostPlugin> = Arc::new(WasmcloudSecrets::new());
     HashMap::from([(secrets.id(), secrets)])

@@ -22,7 +22,7 @@ use bindings::exports::wasmcloud::host::workload_lifecycle::{
 };
 use bindings::wasi::clocks::monotonic_clock;
 use bindings::wasi::clocks::system_clock;
-use bindings::wasmcloud::host::cancel;
+use bindings::wasmcloud::host::{binding_secrets, cancel};
 use bindings::wasmcloud::secrets::reveal;
 use bindings::wasmcloud::secrets::store::SecretValue;
 use wit_bindgen::{FutureReader, StreamReader, StreamResult};
@@ -79,7 +79,7 @@ static PARTITIONS: Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>> =
 static BINDS: Mutex<BTreeMap<String, WorkloadInfo>> = Mutex::new(BTreeMap::new());
 
 /// Each bound workload's revealed secrets, keyed by workload id then key: what
-/// `bound-config` answers for a key the bind handed over as a handle.
+/// `bound-config` answers for a key `binding-secrets` handed over as a handle.
 static REVEALED: Mutex<BTreeMap<String, BTreeMap<String, String>>> = Mutex::new(BTreeMap::new());
 
 /// Lifecycle events observed by this incarnation, oldest first — resets with
@@ -297,7 +297,7 @@ impl Guest for Component {
 }
 
 impl LifecycleGuest for Component {
-    async fn on_workload_bind(mut workload: WorkloadInfo) -> Result<(), String> {
+    async fn on_workload_bind(workload: WorkloadInfo) -> Result<(), String> {
         // Test knobs read from the matched interface config:
         //  - `reject`: fail the bind with the given message.
         //  - `trap-on-bind`: panic every time (an always-poison bind).
@@ -328,8 +328,21 @@ impl LifecycleGuest for Component {
             monotonic_clock::wait_for(slow_bind_ms.saturating_mul(1_000_000)).await;
         }
         let mut revealed = BTreeMap::new();
-        for binding in &mut workload.interfaces {
-            for (key, secret) in std::mem::take(&mut binding.secrets) {
+        for binding in &workload.interfaces {
+            // A bind the host has already given up on is refused its secrets;
+            // logged so a test can see it, and the hook still runs to the end.
+            let Ok(secrets) = binding_secrets::get(
+                &binding.namespace,
+                &binding.package,
+                binding.name.as_deref(),
+            ) else {
+                LIFECYCLE_LOG
+                    .lock()
+                    .unwrap()
+                    .push(format!("secrets-refused:{}", workload.id));
+                break;
+            };
+            for (key, secret) in secrets {
                 let value = match reveal::reveal(&secret).await {
                     SecretValue::String(text) => text,
                     SecretValue::Bytes(bytes) => return Err(format!("`{key}` is not text: {bytes:?}")),

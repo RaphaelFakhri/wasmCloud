@@ -88,8 +88,8 @@ const KV_PLUGIN_WASM: &[u8] = include_bytes!("../tests/wasm/kv_plugin.wasm");
 #[cfg(feature = "host-component-plugins")]
 const KV_PLUGIN_CALLER_WASM: &[u8] = include_bytes!("../tests/wasm/kv_plugin_caller.wasm");
 
-/// The natives kv-plugin links: its lifecycle export takes `wasmcloud:secrets`
-/// handles.
+/// The natives kv-plugin links: it reads its bindings' secrets as
+/// `wasmcloud:secrets` handles.
 fn secrets_native()
 -> std::collections::HashMap<&'static str, Arc<dyn wash_runtime::plugin::HostPlugin>> {
     let secrets: Arc<dyn wash_runtime::plugin::HostPlugin> =

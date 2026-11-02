@@ -99,6 +99,7 @@ use crate::host::trigger_service::{
 use crate::oci::OciConfig;
 use crate::plugin::binding_of;
 use crate::plugin::component_plugin_spec::ComponentPluginSpec;
+use crate::plugin::wasmcloud_secrets::secret_handle;
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::sockets::loopback;
 use crate::types::LocalResources;
@@ -1211,6 +1212,9 @@ fn introspect_capability_exports(
     let mut lifecycle = None;
     let mut secret_source = None;
     let mut exports = Vec::new();
+    let takes_secrets = introspect_imports(component)?
+        .iter()
+        .any(|i| is_reserved(&i.wit) && i.wit.interfaces.contains(HOST_BINDING_SECRETS));
     for export in introspect_exports(component)? {
         if is_reserved(&export.wit) {
             // Matched by interface name, not the exact `export.name` string —
@@ -1218,7 +1222,7 @@ fn introspect_capability_exports(
             // anywhere in it must not break a plugin built against the
             // previous patch version of an interface it already exports.
             if export.wit.interfaces.contains(HOST_LIFECYCLE_EXPORT) {
-                lifecycle = Some(lifecycle_funcs(id, export)?);
+                lifecycle = Some(lifecycle_funcs(id, export, takes_secrets)?);
             } else if export.wit.interfaces.contains(HOST_SECRET_SOURCE_EXPORT) {
                 check_secret_source_export(id, &export)?;
                 secret_source = Some(export.name);
@@ -1363,8 +1367,8 @@ fn classify_workload_imports(
 /// This is the single place that declares the plugin's whole import surface:
 ///
 /// - the WASI (and `wasi:http`) base, from [`Engine::prepare_host_component`];
-/// - the `wasmcloud:host` identity/cancel/workload imports (unused unless the
-///   plugin imports them);
+/// - the `wasmcloud:host` identity/cancel/workload/binding-secrets imports
+///   (unused unless the plugin imports them);
 /// - a route back to the plugin's own capability channel for any interface it
 ///   both imports and exports (a self-import);
 /// - a route out to a workload's export for every import
@@ -1389,6 +1393,8 @@ async fn build_plugin_linker(
         .with_context(|| format!("failed to install host cancel on plugin '{id}'"))?;
     install_host_workload(&mut linker, state)
         .with_context(|| format!("failed to install host workload targeting on plugin '{id}'"))?;
+    install_host_binding_secrets(&mut linker, state)
+        .with_context(|| format!("failed to install host binding secrets on plugin '{id}'"))?;
 
     let mut linked = std::collections::HashSet::new();
     for imported in introspect_imports(component)? {
@@ -1537,6 +1543,91 @@ fn install_host_identity(
         )
         .map_err(|e| e.context("failed to define wasmcloud:host/identity#get-binding-name"))?;
     Ok(())
+}
+
+/// Interface name of the host import a plugin reads its bindings' secrets
+/// through, and its bare name, matched against the plugin's imports.
+const HOST_BINDING_SECRETS_INTERFACE: &str = "wasmcloud:host/binding-secrets@0.1.5";
+const HOST_BINDING_SECRETS: &str = "binding-secrets";
+
+/// Install the `wasmcloud:host/binding-secrets` import on the plugin's own
+/// linker. `get` answers only inside `on-workload-bind`: the caller's root
+/// task must be a lifecycle call, which carries no component, for a workload
+/// still in `bound`. A plugin that does not import it leaves it unused.
+fn install_host_binding_secrets(
+    linker: &mut Linker<SharedCtx>,
+    state: &Arc<ComponentHostPluginState>,
+) -> anyhow::Result<()> {
+    let mut instance = linker
+        .instance(HOST_BINDING_SECRETS_INTERFACE)
+        .map_err(|e| e.context("failed to open the host binding-secrets linker instance"))?;
+    let state = Arc::clone(state);
+    instance
+        .func_new("get", move |mut store, _ty, params, results| {
+            let (namespace, package, name) = match params {
+                [
+                    Val::String(namespace),
+                    Val::String(package),
+                    Val::Option(name),
+                ] => {
+                    let name = match name.as_deref() {
+                        None => None,
+                        Some(Val::String(name)) => Some(name.as_str()),
+                        Some(_) => wasmtime::bail!("binding-secrets#get expects an option<string>"),
+                    };
+                    (namespace.as_str(), package.as_str(), name)
+                }
+                _ => wasmtime::bail!("binding-secrets#get expects a namespace, package and name"),
+            };
+            let result = match bound_secrets(&state, &mut store, namespace, package, name) {
+                Ok(secrets) => {
+                    let mut handles = Vec::with_capacity(secrets.len());
+                    for (key, value) in &secrets {
+                        handles.push(Val::Tuple(vec![
+                            Val::String(key.clone()),
+                            secret_handle(store.as_context_mut(), value)?,
+                        ]));
+                    }
+                    Ok(Some(Box::new(Val::List(handles))))
+                }
+                Err(message) => Err(Some(Box::new(Val::String(message)))),
+            };
+            if let Some(slot) = results.first_mut() {
+                *slot = Val::Result(result);
+            }
+            Ok(())
+        })
+        .map_err(|e| e.context("failed to define wasmcloud:host/binding-secrets#get"))?;
+    Ok(())
+}
+
+/// The secrets of the calling bind's binding of `namespace:package` labeled
+/// `name`, or why there are none to hand over.
+fn bound_secrets(
+    state: &ComponentHostPluginState,
+    store: &mut StoreContextMut<'_, SharedCtx>,
+    namespace: &str,
+    package: &str,
+    name: Option<&str>,
+) -> Result<Vec<(String, crate::plugin::SecretValue)>, String> {
+    let caller = caller_root_task(store).and_then(|task| state.registry()?.caller_for_task(task));
+    let workload_id = match caller.as_ref().and_then(CallerIdentity::workload) {
+        Some(workload) if workload.component_id.is_none() => Arc::clone(&workload.workload_id),
+        _ => return Err("binding-secrets answers only inside on-workload-bind".to_string()),
+    };
+    let bound = state
+        .bound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(info) = bound.get(&workload_id) else {
+        return Err(format!("workload {workload_id} is not being bound"));
+    };
+    info.secrets(namespace, package, name)
+        .map(<[_]>::to_vec)
+        .ok_or_else(|| {
+            let label = name.map(|n| format!(" labeled {n}")).unwrap_or_default();
+            format!("workload {workload_id} has no binding of {namespace}:{package}{label}")
+        })
 }
 
 /// Interface name of the host cancel import a plugin may use to cancel one of its
@@ -2417,7 +2508,7 @@ mod tests {
             bind: Some("192.0.2.10".parse().unwrap()),
         }]);
 
-        // kv-plugin's lifecycle export takes `wasmcloud:secrets` handles.
+        // kv-plugin reads its bindings' secrets as `wasmcloud:secrets` handles.
         let secrets: Arc<dyn HostPlugin> =
             Arc::new(crate::plugin::wasmcloud_secrets::WasmcloudSecrets::new());
         let plugin = load_component_plugin(
