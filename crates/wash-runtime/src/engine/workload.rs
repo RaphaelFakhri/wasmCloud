@@ -9019,6 +9019,12 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "workload_wasi_resource_tests.rs"]
+mod wasi_resource_tests;
+
+#[cfg(test)]
 #[path = "workload_lifecycle_tests.rs"]
 mod lifecycle_tests;
 
