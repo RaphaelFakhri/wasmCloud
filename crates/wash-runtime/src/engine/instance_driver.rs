@@ -561,7 +561,17 @@ impl InstanceDriver {
                 // the handle and the next call starts a fresh instance.
                 tracing::error!(err = ?e, "pooled instance faulted; its in-flight calls failed");
                 crate::engine::trap_remediation::note_guest_fault(store.data(), &e);
+                task_state.retire();
                 replies.fault(&e);
+                drop(store);
+                // Sends reserved before close can still arrive.
+                while let Some((job, _guard)) = rx.recv().await {
+                    if let InstanceJob::Linked(job) = job {
+                        let _ = job
+                            .reply
+                            .send(Err(wasmtime::format_err!("{FAULTED}: {e:#}")));
+                    }
+                }
             }
         });
 
@@ -701,6 +711,14 @@ impl InstanceDriver {
             tokio::sync::mpsc::error::TrySendError::Full((job, _))
             | tokio::sync::mpsc::error::TrySendError::Closed((job, _)) => job,
         })
+    }
+
+    /// Pause a send after admission and capacity reservation.
+    #[cfg(test)]
+    pub(crate) fn reserve_send_for_test(&self) -> impl FnOnce(InstanceJob) + '_ {
+        let guard = self.try_admit().expect("call must be admitted");
+        let permit = self.tx.try_reserve().expect("channel must have capacity");
+        move |job| permit.send((job, guard))
     }
 }
 
