@@ -689,8 +689,12 @@ impl HostPlugin for WasmcloudNats {
         for (name, layer, pending) in declared.host_layers(&super::binding_schema()) {
             let servers = NatsConfig::check_layer(&layer, &pending)
                 .map_err(|e| anyhow::anyhow!("binding `{name}`: {e:#}"))?;
-            self.check_egress(&servers)
-                .with_context(|| format!("binding `{name}`"))?;
+            let checked = self.check_egress(&servers);
+            match super::keys::get(&layer, "servers") {
+                Some(servers) => servers.guard("servers", checked),
+                None => checked,
+            }
+            .with_context(|| format!("binding `{name}`"))?;
         }
         Ok(())
     }
@@ -1342,6 +1346,43 @@ mod tests {
             .with_binding("orders", Config::new())
             .with_binding_secrets("orders", pending("servers"));
         plugin.validate_bindings(&set).unwrap();
+    }
+
+    #[test]
+    fn resolved_secret_servers_are_checked_without_being_quoted() {
+        let plugin = WasmcloudNats::new();
+        plugin
+            .configure_egress_policy(PluginEgressPolicy::allowing(&["allowed.example:4222"]))
+            .unwrap();
+        for key in ["servers", "SERVERS"] {
+            for secret in [false, true] {
+                for server in [
+                    "nats://review-secret.invalid:4222",
+                    "nats://[review-secret.invalid",
+                    "nats://allowed.example:4222",
+                ] {
+                    let mut config = Config::new();
+                    let value = if secret {
+                        ConfigValue::Secret(crate::plugin::SecretValue::new(server))
+                    } else {
+                        ConfigValue::from(server)
+                    };
+                    config.insert(key, value);
+                    let set = PluginBindingSet::new(PLUGIN_NATS_ID).with_binding("orders", config);
+                    let result = plugin.validate_bindings(&set);
+                    if server == "nats://allowed.example:4222" {
+                        result.unwrap();
+                        continue;
+                    }
+                    let err = format!("{:#}", result.unwrap_err());
+                    assert!(err.contains("binding `orders`"), "{err}");
+                    assert_eq!(err.contains("review-secret.invalid"), !secret, "{err}");
+                    if secret {
+                        assert!(err.contains("`servers`"), "{err}");
+                    }
+                }
+            }
+        }
     }
 
     /// A pending key still counts toward the rules its presence decides.

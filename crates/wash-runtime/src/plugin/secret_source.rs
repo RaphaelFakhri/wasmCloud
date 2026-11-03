@@ -16,6 +16,12 @@ use super::HostPlugin;
 use super::bindings::{BindingSchema, KeyOwnership, PluginBindingSet, PluginSecretRef};
 use crate::wit::WitInterface;
 
+mod grant;
+mod selector;
+
+pub use grant::WorkloadGrant;
+pub use selector::WorkloadSelector;
+
 /// A string-backed name, typed so one kind of name can't be passed as another.
 macro_rules! name_type {
     ($(#[$doc:meta])* $name:ident) => {
@@ -77,136 +83,6 @@ name_type!(
     /// `keys`.
     SecretKey
 );
-
-/// The workloads a plugin-backed `secrets:` entry is granted to. Every entry
-/// states one, so none reaches a workload the operator did not name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum WorkloadGrant {
-    /// Every workload on the host: `workloads: all`.
-    All,
-    /// Workloads matching one of these, never empty.
-    Only(Vec<WorkloadSelector>),
-}
-
-/// Workloads in `namespace`, or only the one called `name` there: the name a
-/// workload keeps across replicas, that of the WorkloadDeployment,
-/// WorkloadDaemonSet or WorkloadReplicaSet owning it under the operator, else
-/// its own. Both come
-/// from the start request, so a grant is as strong as whoever may send one.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkloadSelector {
-    pub namespace: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-impl WorkloadSelector {
-    /// Every workload in `namespace`.
-    pub fn namespace(namespace: impl Into<String>) -> Self {
-        Self {
-            namespace: namespace.into(),
-            name: None,
-        }
-    }
-
-    /// The workload called `name` in `namespace`.
-    pub fn workload(namespace: impl Into<String>, name: impl Into<String>) -> Self {
-        Self {
-            namespace: namespace.into(),
-            name: Some(name.into()),
-        }
-    }
-
-    fn admits(&self, workload: &RequestingWorkload) -> bool {
-        self.namespace == workload.namespace
-            && self.name.as_ref().is_none_or(|name| *name == workload.name)
-    }
-}
-
-impl WorkloadGrant {
-    /// Whether `workload` may bind a binding that reads the entry.
-    pub fn admits(&self, workload: &RequestingWorkload) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(selectors) => selectors.iter().any(|s| s.admits(workload)),
-        }
-    }
-}
-
-impl std::fmt::Display for WorkloadGrant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::All => f.write_str("every workload"),
-            Self::Only(selectors) => {
-                let names: Vec<String> = selectors
-                    .iter()
-                    .map(|s| match &s.name {
-                        Some(name) => format!("`{}/{name}`", s.namespace),
-                        None => format!("namespace `{}`", s.namespace),
-                    })
-                    .collect();
-                f.write_str(&names.join(", "))
-            }
-        }
-    }
-}
-
-/// Spelled as the keyword `all`, or a list of selectors. An empty list is
-/// refused here as it is when parsed, so a saved grant always loads again.
-impl serde::Serialize for WorkloadGrant {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::All => s.serialize_str("all"),
-            Self::Only(selectors) if selectors.is_empty() => Err(serde::ser::Error::custom(
-                "`workloads` grants no workload; name at least one namespace, or write `all`",
-            )),
-            Self::Only(selectors) => selectors.serialize(s),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for WorkloadGrant {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Grant;
-
-        impl<'de> serde::de::Visitor<'de> for Grant {
-            type Value = WorkloadGrant;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("`all`, or a list of `namespace` (and optional `name`) selectors")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<WorkloadGrant, E> {
-                match v {
-                    "all" => Ok(WorkloadGrant::All),
-                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
-                }
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<WorkloadGrant, A::Error> {
-                let mut selectors = Vec::new();
-                while let Some(selector) = seq.next_element()? {
-                    selectors.push(selector);
-                }
-                if selectors.is_empty() {
-                    return Err(serde::de::Error::custom(
-                        "`workloads` grants no workload; name at least one namespace, or write \
-                         `all`",
-                    ));
-                }
-                Ok(WorkloadGrant::Only(selectors))
-            }
-        }
-
-        d.deserialize_any(Grant)
-    }
-}
 
 /// What the host asks a [`HostSecretSource`] for, and on whose behalf.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1388,21 +1264,6 @@ mod tests {
         );
         assert!(!err.contains("pw@db"), "{err}");
         assert!(!format!("{filled:?}").contains("pw@db"));
-    }
-
-    /// A grant writes back the way it parses, and an empty one is refused on
-    /// the way out too.
-    #[test]
-    fn a_grant_round_trips() {
-        for grant in [
-            WorkloadGrant::All,
-            WorkloadGrant::Only(vec![WorkloadSelector::workload("billing", "billing-api")]),
-        ] {
-            let json = serde_json::to_string(&grant).unwrap();
-            assert_eq!(serde_json::from_str::<WorkloadGrant>(&json).unwrap(), grant);
-        }
-        let err = serde_json::to_string(&WorkloadGrant::Only(Vec::new())).unwrap_err();
-        assert!(err.to_string().contains("grants no workload"), "{err}");
     }
 
     #[test]

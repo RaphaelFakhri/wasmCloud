@@ -240,7 +240,7 @@ impl ConnectionSettings {
             worst <= MAX_SETTING_MS,
             "redis keyvalue config `{RECONNECT_NUM_RETRIES_KEY}`, \
              `{RECONNECT_MAX_DELAY_MS_KEY}` and `{CONNECTION_TIMEOUT_MS_KEY}` together let one \
-             redial take up to {worst}ms, more than the {MAX_SETTING_MS}ms allowed; lower one \
+             redial exceed the {MAX_SETTING_MS}ms limit; lower one \
              of them"
         );
         Ok(settings)
@@ -344,7 +344,7 @@ fn parse_bounded(key: &str, value: ConfigStr<'_>, min: u64, max: u64) -> anyhow:
     })?;
     anyhow::ensure!(
         (min..=max).contains(&parsed),
-        "redis keyvalue config `{key}` must be between {min} and {max}, got {parsed}"
+        "redis keyvalue config `{key}` must be between {min} and {max}, got {value}"
     );
     Ok(parsed)
 }
@@ -1344,16 +1344,44 @@ mod tests {
 
     #[test]
     fn a_refused_secret_setting_is_not_quoted() {
-        let mut secret = Config::new();
-        secret.insert(
-            RESPONSE_TIMEOUT_MS_KEY,
-            crate::plugin::SecretValue::new("hunter2"),
+        for value in ["hunter2", "987654321"] {
+            let text = config(&[(RESPONSE_TIMEOUT_MS_KEY, value)]);
+            let err = format!("{:#}", ConnectionSettings::from_config(&text).unwrap_err());
+            assert!(err.contains(value), "{err}");
+
+            let mut secret = Config::new();
+            secret.insert(
+                RESPONSE_TIMEOUT_MS_KEY,
+                crate::plugin::SecretValue::new(value),
+            );
+            let err = format!(
+                "{:#}",
+                ConnectionSettings::from_config(&secret).unwrap_err()
+            );
+            assert!(err.contains(RESPONSE_TIMEOUT_MS_KEY), "{err}");
+            assert!(!err.contains(value), "{err}");
+            assert!(err.contains("<redacted>"), "{err}");
+        }
+    }
+
+    #[test]
+    fn redial_limit_errors_do_not_quote_totals_derived_from_secrets() {
+        let mut config = config(&[
+            (RECONNECT_NUM_RETRIES_KEY, "1"),
+            (RECONNECT_MAX_DELAY_MS_KEY, "1"),
+        ]);
+        config.insert(
+            CONNECTION_TIMEOUT_MS_KEY,
+            crate::plugin::SecretValue::new("400601"),
         );
-        let err = ConnectionSettings::from_config(&secret)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains(RESPONSE_TIMEOUT_MS_KEY), "{err}");
-        assert!(!err.contains("hunter2"), "{err}");
+        let err = format!(
+            "{:#}",
+            ConnectionSettings::from_config(&config).unwrap_err()
+        );
+        assert!(err.contains(CONNECTION_TIMEOUT_MS_KEY), "{err}");
+        assert!(err.contains("600000ms limit"), "{err}");
+        assert!(!err.contains("400601"), "{err}");
+        assert!(!err.contains("801203"), "{err}");
     }
 
     #[test]
